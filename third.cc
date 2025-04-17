@@ -13,7 +13,6 @@
 * along with this program; if not, write to the Free Software
 * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 */
-
 #undef PGO_TRAINING
 #define PATH_TO_PGO_CONFIG "path_to_pgo_config"
 
@@ -43,7 +42,7 @@ using namespace std;
 NS_LOG_COMPONENT_DEFINE("GENERIC_SIMULATION");
 
 uint32_t cc_mode = 1;
-bool enable_qcn = true, use_dynamic_pfc_threshold = true;
+bool enable_qcn = true;
 uint32_t packet_payload_size = 1000, l2_chunk_size = 0, l2_ack_interval = 0;
 double pause_time = 5, simulator_stop_time = 3.01;
 std::string data_rate, link_delay, topology_file, flow_file, trace_file, trace_output_file;
@@ -56,7 +55,7 @@ uint32_t fast_recovery_times = 5;
 std::string rate_ai, rate_hai, min_rate = "100Mb/s";
 std::string dctcp_rate_ai = "1000Mb/s";
 
-bool clamp_target_rate = false, l2_back_to_zero = false,mltcp= false;
+bool clamp_target_rate = false, l2_back_to_zero = false;
 double error_rate_per_link = 0.0;
 uint32_t has_win = 1;
 uint32_t global_t = 1;
@@ -91,6 +90,18 @@ unordered_map<uint64_t, double> rate2pmax;
 std::ifstream topof, flowf, tracef;
 
 NodeContainer n;
+NetDeviceContainer switchToSwitchInterfaces;
+std::map< uint32_t,std::map< uint32_t,std::vector<Ptr<QbbNetDevice>> > > switchToSwitch;
+
+
+std::map<uint32_t,uint32_t> switchNumToId;
+std::map<uint32_t,uint32_t> switchIdToNum;
+std::map<uint32_t,NetDeviceContainer> switchUp;
+//NetDeviceContainer switchUp[switch_num];
+std::map<uint32_t,NetDeviceContainer> sourceNodes;
+
+NodeContainer servers;
+NodeContainer tors;
 
 uint64_t nic_rate;
 
@@ -122,24 +133,25 @@ struct FlowInput{
 	uint64_t src, dst, pg, maxPacketCount, port, dport;
 	double start_time;
 	uint32_t idx;
-	uint64_t bytes_per_iteration, gap_per_iteration;
+	uint64_t iteration, gap_per_iteration;
 };
 FlowInput flow_input = {0};
 uint32_t flow_num;
 
 void ReadFlowInput(){
 	if (flow_input.idx < flow_num){
-		flowf >> flow_input.src >> flow_input.dst >> flow_input.pg >> flow_input.dport >> flow_input.maxPacketCount >> flow_input.start_time >> flow_input.bytes_per_iteration >> flow_input.gap_per_iteration;
+		flowf >> flow_input.src >> flow_input.dst >> flow_input.pg >> flow_input.dport >> flow_input.maxPacketCount >> flow_input.start_time >> flow_input.iteration >> flow_input.gap_per_iteration;
+		std::cout << "Flow "<< flow_input.src << " " << flow_input.dst << " " << flow_input.pg << " " << flow_input.dport << " " << flow_input.maxPacketCount << " " << flow_input.start_time << " " << Simulator::Now().GetSeconds() << " "<< flow_input.iteration << " "<< flow_input.gap_per_iteration<<std::endl;
 		NS_ASSERT(n.Get(flow_input.src)->GetNodeType() == 0 && n.Get(flow_input.dst)->GetNodeType() == 0);
 	}
 }
 void ScheduleFlowInputs(){
-	while (flow_input.idx < flow_num && Seconds(flow_input.start_time) == Simulator::Now()){
+	while (flow_input.idx < flow_num && Seconds(flow_input.start_time) <= Simulator::Now()){
 		uint32_t port = portNumder[flow_input.src][flow_input.dst]++; // get a new port number 
-		RdmaClientHelper clientHelper(flow_input.pg, serverAddress[flow_input.src], serverAddress[flow_input.dst], port, flow_input.dport, flow_input.maxPacketCount, has_win?(global_t==1?maxBdp:pairBdp[n.Get(flow_input.src)][n.Get(flow_input.dst)]):0, global_t==1?maxRtt:pairRtt[flow_input.src][flow_input.dst],flow_input.bytes_per_iteration ,flow_input.gap_per_iteration);
+		RdmaClientHelper clientHelper(flow_input.pg, serverAddress[flow_input.src], serverAddress[flow_input.dst], port, flow_input.dport, flow_input.maxPacketCount, has_win?(global_t==1?maxBdp:pairBdp[n.Get(flow_input.src)][n.Get(flow_input.dst)]):0, global_t==1?maxRtt:pairRtt[flow_input.src][flow_input.dst],Seconds(flow_input.start_time)+Seconds(100*flow_num),flow_input.iteration ,flow_input.gap_per_iteration);
 		ApplicationContainer appCon = clientHelper.Install(n.Get(flow_input.src));
-		appCon.Start(Time(0));
-		
+//		appCon.Start(Seconds(flow_input.start_time));
+		appCon.Start(Seconds(0)); // setting the correct time here conflicts with Sim time since there is already a schedule event that triggered this function at desired time.
 		// get the next flow input
 		flow_input.idx++;
 		ReadFlowInput();
@@ -334,29 +346,75 @@ uint64_t get_nic_rate(NodeContainer &n){
 			return DynamicCast<QbbNetDevice>(n.Get(i)->GetDevice(1))->GetDataRate().GetBitRate();
 }
 
+void PrintResults(std::map<uint32_t,NetDeviceContainer> ToR,uint32_t numToRs,double delay){
+	for (uint32_t i=0; i<numToRs;i++){
+		double throughputTotal=0;
+		uint64_t torBuffer;
+		for (uint32_t j=0; j< ToR[i].GetN();j++){
+			Ptr<QbbNetDevice> nd = DynamicCast<QbbNetDevice>(ToR[i].Get(j));
+//			uint64_t txBytes = nd->getTxBytes();
+			uint64_t txBytes = nd->GetQueue()->getTxBytes();
+
+			uint64_t qlen = nd->GetQueue()->GetNBytesTotal();
+			double throughput = double(txBytes*8)/delay;
+			throughputTotal+=throughput;
+			std::cout << "ToR " << i << " Port " << j << " throughput "<< throughput << " txBytes " << txBytes << " qlen " << qlen << " time " << Simulator::Now().GetSeconds() << std::endl;
+		}
+		std::cout << "ToR " << i << " Total " << 0 << " throughput " << throughputTotal <<  " time " << Simulator::Now().GetSeconds() << std::endl;
+	}
+	Simulator::Schedule(Seconds(delay),PrintResults,ToR,numToRs,delay);
+}
+
+
+void PrintResultsFlow(std::map<uint32_t,NetDeviceContainer> Src,uint32_t numFlows,double delay){
+	for (uint32_t i=0; i<numFlows;i++){
+		double throughputTotal=0;
+
+		for (uint32_t j=0; j< Src[i].GetN();j++){
+			Ptr<QbbNetDevice> nd = DynamicCast<QbbNetDevice>(Src[i].Get(j));
+//			uint64_t txBytes = nd->getTxBytes();
+			uint64_t txBytes = nd->getNumTxBytes();
+
+			uint64_t qlen = nd->GetQueue()->GetNBytesTotal();
+			double throughput = double(txBytes*8)/delay;
+			throughputTotal+=throughput;
+			// std::cout << "Src " << i << " Port " << j << " throughput "<< throughput << " txBytes " << txBytes << " qlen " << qlen << " time " << Simulator::Now().GetSeconds() << std::endl;
+		}
+		std::cout << "Src " << i << " Total " << 0 << " throughput " << throughputTotal <<  " time " << Simulator::Now().GetSeconds() << std::endl;
+	}
+	Simulator::Schedule(Seconds(delay),PrintResultsFlow,Src,numFlows,delay);
+}
+
+
+
+
 int main(int argc, char *argv[])
 {
 	clock_t begint, endt;
 	begint = clock();
-#ifndef PGO_TRAINING
-	if (argc > 1)
-#else
-	if (true)
-#endif
-	{
-		//Read the configuration file
 		std::ifstream conf;
-#ifndef PGO_TRAINING
-		conf.open(argv[1]);
-#else
-		conf.open(PATH_TO_PGO_CONFIG);
-#endif
+		bool wien = true; // wien enables Flex. 
+		bool delayWien = false; // delayWien enables Theta-Flex (delaypowertcp) 
+
+		uint32_t algorithm=1;
+		uint32_t windowCheck=1;
+		std::string confFile = "/home/why/ns3-datacenter/simulator/ns-3.39/examples/Flex/config-flex.txt";
+
+		std::cout << confFile;
+		CommandLine cmd;
+		cmd.AddValue("conf", "config file path", confFile);
+		cmd.AddValue("wien", "enable wien --> wien enables PowerTCP.", wien);
+		cmd.AddValue("delayWien", "enable wien delay --> delayWien enables Theta-PowerTCP (delaypowertcp) ", delayWien);
+
+		cmd.AddValue ("algorithm", "specify CC mode. This is added for my convinience since I prefer cmd rather than parsing files.", algorithm);
+	    cmd.AddValue("windowCheck","windowCheck",windowCheck);
+
+		cmd.Parse (argc,argv);
+		conf.open(confFile.c_str());
 		while (!conf.eof())
 		{
 			std::string key;
 			conf >> key;
-
-			//std::cout << conf.cur << "\n";
 
 			if (key.compare("ENABLE_QCN") == 0)
 			{
@@ -367,16 +425,6 @@ int main(int argc, char *argv[])
 					std::cout << "ENABLE_QCN\t\t\t" << "Yes" << "\n";
 				else
 					std::cout << "ENABLE_QCN\t\t\t" << "No" << "\n";
-			}
-			else if (key.compare("USE_DYNAMIC_PFC_THRESHOLD") == 0)
-			{
-				uint32_t v;
-				conf >> v;
-				use_dynamic_pfc_threshold = v;
-				if (use_dynamic_pfc_threshold)
-					std::cout << "USE_DYNAMIC_PFC_THRESHOLD\t" << "Yes" << "\n";
-				else
-					std::cout << "USE_DYNAMIC_PFC_THRESHOLD\t" << "No" << "\n";
 			}
 			else if (key.compare("CLAMP_TARGET_RATE") == 0)
 			{
@@ -652,40 +700,24 @@ int main(int argc, char *argv[])
 				conf >> pint_prob;
 				std::cout << "PINT_PROB\t\t\t\t" << pint_prob << '\n';
 			}
-			else if (key.compare("mltcp") == 0)
-			{
-				uint32_t v;
-				conf >> v;
-				mltcp = v;
-				if (mltcp)
-					std::cout << "MLTCP\t\t\t" << "Yes" << "\n";
-				else
-					std::cout << "MLTCP\t\t\t" << "No" << "\n";
-			}
 			fflush(stdout);
 		}
 		conf.close();
-	}
-	else
-	{
-		std::cout << "Error: require a config file\n";
-		fflush(stdout);
-		return 1;
-	}
 
+		// overriding config file. I prefer to use cmd arguments
+		cc_mode = algorithm; // overrides configuration file
+		has_win=windowCheck; // overrides configuration file
 
-	bool dynamicth = use_dynamic_pfc_threshold;
 
 	Config::SetDefault("ns3::QbbNetDevice::PauseTime", UintegerValue(pause_time));
 	Config::SetDefault("ns3::QbbNetDevice::QcnEnabled", BooleanValue(enable_qcn));
-	Config::SetDefault("ns3::QbbNetDevice::DynamicThreshold", BooleanValue(dynamicth));
 
 	// set int_multi
 	IntHop::multi = int_multi;
 	// IntHeader::mode
 	if (cc_mode == 7) // timely, use ts
 		IntHeader::mode = IntHeader::TS;
-	else if (cc_mode == 3) // hpcc, use int
+	else if (cc_mode == 3) // hpcc, powertcp, use int
 		IntHeader::mode = IntHeader::NORMAL;
 	else if (cc_mode == 10) // hpcc-pint
 		IntHeader::mode = IntHeader::PINT;
@@ -696,35 +728,61 @@ int main(int argc, char *argv[])
 	if (cc_mode == 10){
 		Pint::set_log_base(pint_log_base);
 		IntHeader::pint_bytes = Pint::get_n_bytes();
-		printf("PINT bits: %d bytes: %d\n", Pint::get_n_bits(), Pint::get_n_bytes());
 	}
-
-	//SeedManager::SetSeed(time(NULL));
 
 	topof.open(topology_file.c_str());
 	flowf.open(flow_file.c_str());
-	tracef.open(trace_file.c_str());
-	uint32_t node_num, switch_num, link_num, trace_num;
-	topof >> node_num >> switch_num >> link_num;
+	uint32_t node_num, switch_num, tors, link_num, trace_num;
+	topof >> node_num >> switch_num >> tors >> link_num; // changed here. The previous order was node, switch, link // tors is not used. switch_num=tors for now.
+	tors=switch_num;
+	std::cout << node_num << " " << switch_num << " " << tors <<  " " << link_num << std::endl;
 	flowf >> flow_num;
-	tracef >> trace_num;
 
+	NodeContainer serverNodes;
+	NodeContainer torNodes;
+	NodeContainer spineNodes;
+	NodeContainer switchNodes;
+	NodeContainer allNodes;
 
-	//n.Create(node_num);
 	std::vector<uint32_t> node_type(node_num, 0);
-	for (uint32_t i = 0; i < switch_num; i++)
-	{
+
+	std::cout << "switch_num "<< switch_num << std::endl;
+	for (uint32_t i=0;i<switch_num;i++){
 		uint32_t sid;
 		topof >> sid;
-		node_type[sid] = 1;
+		std::cout << "sid " << sid << std::endl;
+		switchNumToId[i]=sid;
+		switchIdToNum[sid]=i;
+		if(i<tors){
+			node_type[sid]=1;
+		}
+		else
+			node_type[sid]=2;
+
 	}
+
 	for (uint32_t i = 0; i < node_num; i++){
-		if (node_type[i] == 0)
-			n.Add(CreateObject<Node>());
+		if (node_type[i] == 0){
+			Ptr<Node> node = CreateObject<Node>();
+			n.Add(node);
+			allNodes.Add(node);
+			serverNodes.Add(node);
+		}
 		else{
 			Ptr<SwitchNode> sw = CreateObject<SwitchNode>();
 			n.Add(sw);
+			switchNodes.Add(sw);
+			allNodes.Add(sw);
 			sw->SetAttribute("EcnEnabled", BooleanValue(enable_qcn));
+			if (node_type[i]==1){
+				torNodes.Add(sw);
+				sw->SetNodeType(1);
+			}
+			else{
+				spineNodes.Add(sw);
+				sw->SetNodeType(2);
+			}
+
 		}
 	}
 
@@ -768,7 +826,9 @@ int main(int argc, char *argv[])
 		double error_rate;
 		topof >> src >> dst >> data_rate >> link_delay >> error_rate;
 
+		std::cout << src << " " << dst << " " << n.GetN()<< std::endl;
 		Ptr<Node> snode = n.Get(src), dnode = n.Get(dst);
+
 
 		qbb.SetDeviceAttribute("DataRate", StringValue(data_rate));
 		qbb.SetChannelAttribute("Delay", StringValue(link_delay));
@@ -806,6 +866,20 @@ int main(int argc, char *argv[])
 			ipv4->AddAddress(1, Ipv4InterfaceAddress(serverAddress[dst], Ipv4Mask(0xff000000)));
 		}
 
+
+		if (!snode->GetNodeType()){
+			sourceNodes[src].Add(DynamicCast<QbbNetDevice>(d.Get(0)));
+		}
+
+
+		if(snode->GetNodeType()&& dnode->GetNodeType()){
+			switchToSwitchInterfaces.Add(d);
+			switchUp[switchIdToNum[src]].Add(DynamicCast<QbbNetDevice>(d.Get(0)));
+			switchUp[switchIdToNum[dst]].Add(DynamicCast<QbbNetDevice>(d.Get(1)));
+			switchToSwitch[src][dst].push_back(DynamicCast<QbbNetDevice>(d.Get(0)));
+			switchToSwitch[src][dst].push_back(DynamicCast<QbbNetDevice>(d.Get(1)));
+		}
+
 		// used to create a graph of the topology
 		nbr2if[snode][dnode].idx = DynamicCast<QbbNetDevice>(d.Get(0))->GetIfIndex();
 		nbr2if[snode][dnode].up = true;
@@ -817,45 +891,51 @@ int main(int argc, char *argv[])
 		nbr2if[dnode][snode].bw = DynamicCast<QbbNetDevice>(d.Get(1))->GetDataRate().GetBitRate();
 
 		// This is just to set up the connectivity between nodes. The IP addresses are useless
-		char ipstring[16];
-		sprintf(ipstring, "10.%d.%d.0", i / 254 + 1, i % 254 + 1);
-		ipv4.SetBase(ipstring, "255.255.255.0");
+		// char ipstring[16];
+		std::stringstream ipstring;
+		ipstring << "10."<< i / 254 + 1 << "." << i % 254 + 1 << ".0";
+		// sprintf(ipstring, "10.%d.%d.0", i / 254 + 1, i % 254 + 1);
+		ipv4.SetBase(ipstring.str().c_str(), "255.255.255.0");
 		ipv4.Assign(d);
 
 		// setup PFC trace
-		DynamicCast<QbbNetDevice>(d.Get(0))->TraceConnectWithoutContext("QbbPfc", MakeBoundCallback (&get_pfc, pfc_file, DynamicCast<QbbNetDevice>(d.Get(0))));
-		DynamicCast<QbbNetDevice>(d.Get(1))->TraceConnectWithoutContext("QbbPfc", MakeBoundCallback (&get_pfc, pfc_file, DynamicCast<QbbNetDevice>(d.Get(1))));
+		// DynamicCast<QbbNetDevice>(d.Get(0))->TraceConnectWithoutContext("QbbPfc", MakeBoundCallback (&get_pfc, pfc_file, DynamicCast<QbbNetDevice>(d.Get(0))));
+		// DynamicCast<QbbNetDevice>(d.Get(1))->TraceConnectWithoutContext("QbbPfc", MakeBoundCallback (&get_pfc, pfc_file, DynamicCast<QbbNetDevice>(d.Get(1))));
 	}
 
 	nic_rate = get_nic_rate(n);
 
 	// config switch
-	for (uint32_t i = 0; i < node_num; i++){
-		if (n.Get(i)->GetNodeType() == 1){ // is switch
+	// The switch mmu runs Dynamic Thresholds (DT) by default.
+	for (uint32_t i = 0; i < node_num; i++) {
+		if (n.Get(i)->GetNodeType()) { // is switch
 			Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(n.Get(i));
 			uint32_t shift = 3; // by default 1/8
-			for (uint32_t j = 1; j < sw->GetNDevices(); j++){
-				Ptr<QbbNetDevice> dev = DynamicCast<QbbNetDevice>(sw->GetDevice(j));
-				// set ecn
-				uint64_t rate = dev->GetDataRate().GetBitRate();
-				NS_ASSERT_MSG(rate2kmin.find(rate) != rate2kmin.end(), "must set kmin for each link speed");
-				NS_ASSERT_MSG(rate2kmax.find(rate) != rate2kmax.end(), "must set kmax for each link speed");
-				NS_ASSERT_MSG(rate2pmax.find(rate) != rate2pmax.end(), "must set pmax for each link speed");
-				sw->m_mmu->ConfigEcn(j, rate2kmin[rate], rate2kmax[rate], rate2pmax[rate]);
-				// set pfc
-				uint64_t delay = DynamicCast<QbbChannel>(dev->GetChannel())->GetDelay().GetTimeStep();
-				uint32_t headroom = rate * delay / 8 / 1000000000 * 3;
-				sw->m_mmu->ConfigHdrm(j, headroom);
-
-				// set pfc alpha, proportional to link bw
-				sw->m_mmu->pfc_a_shift[j] = shift;
-				while (rate > nic_rate && sw->m_mmu->pfc_a_shift[j] > 0){
-					sw->m_mmu->pfc_a_shift[j]--;
-					rate /= 2;
+			double alpha = 1.0/8;
+			sw->m_mmu->SetAlphaIngress(alpha);
+			uint64_t totalHeadroom = 0;
+			for (uint32_t j = 1; j < sw->GetNDevices(); j++) {
+				
+				for (uint32_t qu = 0; qu < 8; qu++){
+					Ptr<QbbNetDevice> dev = DynamicCast<QbbNetDevice>(sw->GetDevice(j));
+					// set ecn
+					uint64_t rate = dev->GetDataRate().GetBitRate();
+					NS_ASSERT_MSG(rate2kmin.find(rate) != rate2kmin.end(), "must set kmin for each link speed");
+					NS_ASSERT_MSG(rate2kmax.find(rate) != rate2kmax.end(), "must set kmax for each link speed");
+					NS_ASSERT_MSG(rate2pmax.find(rate) != rate2pmax.end(), "must set pmax for each link speed");
+					sw->m_mmu->ConfigEcn(j, rate2kmin[rate], rate2kmax[rate], rate2pmax[rate]);
+					// set pfc
+					uint64_t delay = DynamicCast<QbbChannel>(dev->GetChannel())->GetDelay().GetTimeStep();
+					uint32_t headroom = rate * delay / 8 / 1000000000 * 3;
+					
+					sw->m_mmu->SetHeadroom(headroom, j, qu);
+					totalHeadroom += headroom;
 				}
+
 			}
-			sw->m_mmu->ConfigNPort(sw->GetNDevices()-1);
-			sw->m_mmu->ConfigBufferSize(buffer_size* 1024 * 1024);
+			sw->m_mmu->SetBufferPool(buffer_size * 1024 * 1024);
+			sw->m_mmu->SetIngressPool(buffer_size * 1024 * 1024 - totalHeadroom);
+			sw->m_mmu->SetEgressLosslessPool(buffer_size * 1024 * 1024);
 			sw->m_mmu->node_id = sw->GetId();
 		}
 	}
@@ -891,8 +971,9 @@ int main(int argc, char *argv[])
 			rdmaHw->SetAttribute("TargetUtil", DoubleValue(u_target));
 			rdmaHw->SetAttribute("RateBound", BooleanValue(rate_bound));
 			rdmaHw->SetAttribute("DctcpRateAI", DataRateValue(DataRate(dctcp_rate_ai)));
+			rdmaHw->SetAttribute("PowerTCPEnabled", BooleanValue(wien));
+			rdmaHw->SetAttribute("PowerTCPdelay", BooleanValue(delayWien));
 			rdmaHw->SetPintSmplThresh(pint_prob);
-			rdmaHw->SetAttribute("MLTCP", BooleanValue(mltcp));
 			// create and install RdmaDriver
 			Ptr<RdmaDriver> rdma = CreateObject<RdmaDriver>();
 			Ptr<Node> node = n.Get(i);
@@ -904,6 +985,7 @@ int main(int argc, char *argv[])
 			rdma->TraceConnectWithoutContext("QpComplete", MakeBoundCallback (qp_finish, fct_output));
 		}
 	}
+
 	#endif
 
 	// set ACK priority on hosts
@@ -914,7 +996,9 @@ int main(int argc, char *argv[])
 
 	// setup routing
 	CalculateRoutes(n);
+	std::cout << "yeah " << 0<<  std::endl;
 	SetRoutingEntries();
+	std::cout << "yeah " << 1<<  std::endl;
 
 	//
 	// get BDP and delay
@@ -945,45 +1029,12 @@ int main(int argc, char *argv[])
 	// setup switch CC
 	//
 	for (uint32_t i = 0; i < node_num; i++){
-		if (n.Get(i)->GetNodeType() == 1){ // switch
+		if (n.Get(i)->GetNodeType()){ // switch
 			Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(n.Get(i));
 			sw->SetAttribute("CcMode", UintegerValue(cc_mode));
 			sw->SetAttribute("MaxRtt", UintegerValue(maxRtt));
+			sw->SetAttribute("PowerEnabled", BooleanValue(wien));
 		}
-	}
-
-	//
-	// add trace
-	//
-
-	NodeContainer trace_nodes;
-	for (uint32_t i = 0; i < trace_num; i++)
-	{
-		uint32_t nid;
-		tracef >> nid;
-		if (nid >= n.GetN()){
-			continue;
-		}
-		trace_nodes = NodeContainer(trace_nodes, n.Get(nid));
-	}
-
-	FILE *trace_output = fopen(trace_output_file.c_str(), "w");
-	if (enable_trace)
-		qbb.EnableTracing(trace_output, trace_nodes);
-
-	// dump link speed to trace file
-	{
-		SimSetting sim_setting;
-		for (auto i: nbr2if){
-			for (auto j : i.second){
-				uint16_t node = i.first->GetId();
-				uint8_t intf = j.second.idx;
-				uint64_t bps = DynamicCast<QbbNetDevice>(i.first->GetDevice(j.second.idx))->GetDataRate().GetBitRate();
-				sim_setting.port_speed[node][intf] = bps;
-			}
-		}
-		sim_setting.win = maxBdp;
-		sim_setting.Serialize(trace_output);
 	}
 
 	Ipv4GlobalRoutingHelper::PopulateRoutingTables();
@@ -991,6 +1042,7 @@ int main(int argc, char *argv[])
 	NS_LOG_INFO("Create Applications.");
 
 	Time interPacketInterval = Seconds(0.0000005 / 2);
+
 
 	// maintain port number for each host
 	for (uint32_t i = 0; i < node_num; i++){
@@ -1001,37 +1053,27 @@ int main(int argc, char *argv[])
 			}
 	}
 
+
 	flow_input.idx = 0;
 	if (flow_num > 0){
 		ReadFlowInput();
+		std::cout << flow_input.start_time << std::endl;
 		Simulator::Schedule(Seconds(flow_input.start_time)-Simulator::Now(), ScheduleFlowInputs);
 	}
 
+	uint64_t factor=1e2;
 	topof.close();
 	tracef.close();
+	double delay = 0.5*factor*maxRtt*1e-9; // 10 micro seconds 
+	Simulator::Schedule(Seconds(delay),PrintResultsFlow,sourceNodes,flow_num,delay);
 
-	// schedule link down
-	if (link_down_time > 0){
-		Simulator::Schedule(Seconds(2) + MicroSeconds(link_down_time), &TakeDownLink, n, n.Get(link_down_A), n.Get(link_down_B));
-	}
-
-	// schedule buffer monitor
-	FILE* qlen_output = fopen(qlen_mon_file.c_str(), "w");
-	Simulator::Schedule(NanoSeconds(qlen_mon_start), &monitor_buffer, qlen_output, &n);
-
-	//
-	// Now, do the actual simulation.
-	//
 	std::cout << "Running Simulation.\n";
-	fflush(stdout);
 	NS_LOG_INFO("Run Simulation.");
 	Simulator::Stop(Seconds(simulator_stop_time));
 	Simulator::Run();
 	Simulator::Destroy();
 	NS_LOG_INFO("Done.");
-	fclose(trace_output);
 
 	endt = clock();
 	std::cout << (double)(endt - begint) / CLOCKS_PER_SEC << "\n";
-
 }
